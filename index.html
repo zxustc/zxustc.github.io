@@ -18,6 +18,12 @@
     <section class="panel">
       <h2>📍 地点管理</h2>
       <div class="row">
+        <div class="search-wrap">
+          <input id="loc-search" type="text" placeholder="🔍 搜索地点（如：张掖、张掖丹霞景区），自动填充经纬度" autocomplete="off">
+          <div id="loc-search-dropdown" class="search-dropdown hidden"></div>
+        </div>
+      </div>
+      <div class="row" style="margin-top:10px">
         <input id="loc-name" type="text" placeholder="地点名称（如：张掖丹霞）" autocomplete="off">
         <input id="loc-coord" type="text" placeholder="纬度, 经度（支持 38.91555,100.1332 或度分秒 38°54′55.98″N 100°7′59.52″E）" autocomplete="off">
         <button id="btn-add" class="btn primary">保存地点</button>
