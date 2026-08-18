@@ -149,6 +149,88 @@ function cryptoRandomId() {
   return (globalThis.crypto && crypto.randomUUID) ? crypto.randomUUID() : 'id-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
 }
 
+/* ===== 地点搜索：Open-Meteo Geocoding（城市级）+ Nominatim（POI/景区级） ===== */
+const GEO_API = 'https://geocoding-api.open-meteo.com/v1/search';
+const NOMINATIM_API = 'https://nominatim.openstreetmap.org/search';
+let lastNominatimTs = 0; // Nominatim 使用政策限速：≥1.1s/次
+
+async function searchPlaces(q) {
+  const items = [];
+  const seen = new Set();
+  const add = (name, sub, lat, lon, src) => {
+    const key = `${lat.toFixed(3)},${lon.toFixed(3)}`;
+    if (seen.has(key)) return; // 去重（两源结果可能重合）
+    seen.add(key);
+    items.push({ name, sub, lat, lon, src });
+  };
+
+  // 1) Open-Meteo Geocoding：城市 / 地级市级
+  try {
+    const url = new URL(GEO_API);
+    url.searchParams.set('name', q);
+    url.searchParams.set('count', '6');
+    url.searchParams.set('language', 'zh');
+    url.searchParams.set('format', 'json');
+    const resp = await fetch(url.toString());
+    if (resp.ok) {
+      const data = await resp.json();
+      for (const r of data.results || []) {
+        const region = [r.admin1, r.admin2].filter(Boolean).join(' · ');
+        add(r.name, [region, r.country].filter(Boolean).join(' · '), r.latitude, r.longitude, 'Open-Meteo');
+      }
+    }
+  } catch (e) { /* 单源失败不影响整体 */ }
+
+  // 2) Nominatim：POI 级（景区/地标等），遵守限速
+  const now = Date.now();
+  if (now - lastNominatimTs >= 1100) {
+    lastNominatimTs = now;
+    try {
+      const url = new URL(NOMINATIM_API);
+      url.searchParams.set('q', q);
+      url.searchParams.set('format', 'jsonv2');
+      url.searchParams.set('limit', '5');
+      const resp = await fetch(url.toString(), { headers: { 'Accept-Language': 'zh-CN,zh;q=0.9' } });
+      if (resp.ok) {
+        const data = await resp.json();
+        for (const r of data) {
+          add(r.name || r.display_name.split(',')[0], r.display_name, Number(r.lat), Number(r.lon), 'OpenStreetMap');
+        }
+      }
+    } catch (e) { /* 忽略 */ }
+  }
+  return items;
+}
+
+function showSearchDropdown(items) {
+  const dd = $('#loc-search-dropdown');
+  dd._items = items;
+  if (!items.length) {
+    dd.innerHTML = '<div class="sug-empty">未找到匹配地点，请尝试其他名称或直接输入经纬度</div>';
+    dd.classList.remove('hidden');
+    return;
+  }
+  dd.innerHTML = items.map((it, i) => `
+    <button type="button" class="sug" data-i="${i}">
+      <span class="sug-name">${escapeHtml(it.name)} <em class="sug-src">${escapeHtml(it.src)}</em></span>
+      <span class="sug-sub">${escapeHtml(it.sub)}</span>
+    </button>`).join('');
+  dd.querySelectorAll('.sug').forEach(btn => {
+    btn.addEventListener('click', () => fillFromSearch(items[Number(btn.dataset.i)]));
+  });
+  dd.classList.remove('hidden');
+}
+
+/* 选中候选 → 自动填充地点名称 + 经纬度输入框 */
+function fillFromSearch(item) {
+  $('#loc-name').value = item.name;
+  $('#loc-coord').value = `${item.lat.toFixed(5)}, ${item.lon.toFixed(5)}`;
+  $('#loc-search').value = '';
+  $('#loc-search-dropdown').classList.add('hidden');
+  setHint(`已填入「${item.name}」（${item.src}，${formatCoord(item.lat, item.lon)}），可修改后保存`, 'ok');
+  $('#loc-name').focus();
+}
+
 /* ===== 查询：Open-Meteo ===== */
 async function fetchWeather(loc, days) {
   const url = new URL(API_BASE);
@@ -592,6 +674,38 @@ function init() {
 
   $('#loc-name').addEventListener('keydown', e => { if (e.key === 'Enter') $('#btn-add').click(); });
   $('#loc-coord').addEventListener('keydown', e => { if (e.key === 'Enter') $('#btn-add').click(); });
+
+  // 地点搜索：防抖 400ms
+  let searchTimer = null;
+  $('#loc-search').addEventListener('input', () => {
+    const q = $('#loc-search').value.trim();
+    clearTimeout(searchTimer);
+    if (q.length < 1) {
+      $('#loc-search-dropdown').classList.add('hidden');
+      return;
+    }
+    searchTimer = setTimeout(async () => {
+      const items = await searchPlaces(q);
+      showSearchDropdown(items);
+    }, 400);
+  });
+  $('#loc-search').addEventListener('keydown', (e) => {
+    const dd = $('#loc-search-dropdown');
+    if (e.key === 'Enter') {
+      if (!dd.classList.contains('hidden') && dd._items && dd._items.length) {
+        e.preventDefault();
+        fillFromSearch(dd._items[0]);
+      }
+    } else if (e.key === 'Escape') {
+      dd.classList.add('hidden');
+    }
+  });
+  // 点击页面其他区域收起下拉
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('.search-wrap')) {
+      $('#loc-search-dropdown').classList.add('hidden');
+    }
+  });
 
   // 事件委托：删除 / 填入
   $('#loc-list').addEventListener('click', (e) => {
