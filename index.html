@@ -65,7 +65,7 @@
     <!-- 行程规划器 -->
     <section class="panel" id="itinerary-panel">
       <h2>🗺️ 行程规划器</h2>
-      <p class="panel-desc">按天安排行程：每天分「日出 / 上午 / 下午 / 夕阳」4 个时段，每个时段填入一个地点，即可查看该地点的出游适宜度（通透度 + 天气 + 温度）。</p>
+      <p class="panel-desc">可添加多段行程对比。每段行程按天安排，每天分「日出 / 上午 / 下午 / 夕阳」4 个时段，每个时段填入一个地点，即可查看该地点的出游适宜度（通透度 + 天气 + 温度）。</p>
       <div class="row">
         <div class="field">
           <label for="itin-start">起始日期</label>
@@ -75,7 +75,7 @@
           <label for="itin-days">行程 <b id="itin-days-val">3</b> 天</label>
           <input type="range" id="itin-days" min="1" max="10" value="3" step="1">
         </div>
-        <button id="btn-itin-generate" class="btn">生成行程</button>
+        <button id="btn-itin-generate" class="btn">新增行程</button>
         <button id="btn-itin-query" class="btn primary big">查询行程适宜度</button>
       </div>
       <div id="itin-hint" class="hint"></div>

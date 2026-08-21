@@ -1153,11 +1153,13 @@ async function queryAll() {
   if (!selectedIdx.length) {
     hint.textContent = '请至少勾选一个地点';
     hint.className = 'hint err';
+    queryItinerary(); // 行程区独立查询，不因主区缺地点而中断
     return;
   }
   if (!selectedPeriods.length) {
     hint.textContent = '请至少勾选一个时段';
     hint.className = 'hint err';
+    queryItinerary();
     return;
   }
 
@@ -1234,25 +1236,41 @@ async function queryAll() {
     box.appendChild(errBox);
   }
   renderResults(cards);
+
+  // 自动联动：查询天气时一并查询行程适宜度
+  await queryItinerary();
 }
 
 /* ===== 行程规划器 ===== */
-const ITIN_STORAGE_KEY = 'wttr.itinerary.v1';
-let itinerary = loadItinerary();
+const ITIN_STORAGE_KEY = 'wttr.itineraries.v1';
+const ITIN_OLD_STORAGE_KEY = 'wttr.itinerary.v1';
+let itineraries = loadItineraries();
 
-function loadItinerary() {
+/* 行程结构：Array<{ id, name, days: Array<{date, weekday, periods}> }> */
+function loadItineraries() {
   try {
     const raw = localStorage.getItem(ITIN_STORAGE_KEY);
     if (raw) {
       const list = JSON.parse(raw);
-      if (Array.isArray(list) && list.length) return list;
+      if (Array.isArray(list)) return list.filter(t => t && Array.isArray(t.days));
+    }
+    // 旧版本迁移：单行程数组 → 包装成一段行程
+    const oldRaw = localStorage.getItem(ITIN_OLD_STORAGE_KEY);
+    if (oldRaw) {
+      const old = JSON.parse(oldRaw);
+      if (Array.isArray(old) && old.length) {
+        const migrated = [{ id: cryptoRandomId(), name: '行程 1', days: old }];
+        localStorage.setItem(ITIN_STORAGE_KEY, JSON.stringify(migrated));
+        localStorage.removeItem(ITIN_OLD_STORAGE_KEY);
+        return migrated;
+      }
     }
   } catch { /* 存储不可用则返回空 */ }
   return [];
 }
 
-function saveItinerary() {
-  try { localStorage.setItem(ITIN_STORAGE_KEY, JSON.stringify(itinerary)); }
+function saveItineraries() {
+  try { localStorage.setItem(ITIN_STORAGE_KEY, JSON.stringify(itineraries)); }
   catch (e) { console.warn('保存行程失败', e); }
 }
 
@@ -1272,8 +1290,8 @@ function daysBetween(fromStr, toStr) {
   return Math.round((to - from) / 86400000);
 }
 
-/* 生成空行程结构（不渲染、不提示），供 init 与 generateItinerary 复用 */
-function buildItinerary(startStr, days) {
+/* 生成空行程的 days 数组（不渲染、不提示），供 init 与 addItinerary 复用 */
+function buildItineraryDays(startStr, days) {
   const start = new Date(startStr + 'T00:00:00');
   const list = [];
   for (let i = 0; i < days; i++) {
@@ -1285,41 +1303,65 @@ function buildItinerary(startStr, days) {
   return list;
 }
 
-function generateItinerary(startStr, days) {
+function addItinerary(startStr, days) {
   if (!startStr) { itinHint('请选择起始日期', 'err'); return; }
   const todayStr = localTodayStr();
   if (startStr < todayStr) { itinHint('起始日期不能早于今天', 'err'); return; }
   if (daysBetween(todayStr, startStr) + days > 16) { itinHint('超出预报范围（未来最多 16 天）', 'err'); return; }
-  itinerary = buildItinerary(startStr, days);
-  saveItinerary();
-  renderItinerary();
-  itinHint(`已生成 ${days} 天行程（${itinerary[0].date} 起）`, 'ok');
+  const name = `行程 ${itineraries.length + 1}`;
+  itineraries.push({ id: cryptoRandomId(), name, days: buildItineraryDays(startStr, days) });
+  saveItineraries();
+  renderItineraries();
+  itinHint(`已新增「${name}」（${days} 天，${startStr} 起），共 ${itineraries.length} 段行程`, 'ok');
 }
 
-function renderItinerary() {
+function removeItinerary(index) {
+  itineraries.splice(index, 1);
+  saveItineraries();
+  renderItineraries();
+  itinHint(`已删除行程，剩余 ${itineraries.length} 段`, '');
+}
+
+function renameItinerary(index, name) {
+  itineraries[index].name = (name || '').trim() || `行程 ${index + 1}`;
+  saveItineraries();
+}
+
+function renderItineraries() {
   const list = $('#itin-list');
   if (!list) return;
-  if (!itinerary.length) {
-    list.innerHTML = '<div class="itin-empty">点击「生成行程」开始规划你的路线</div>';
+  if (!itineraries.length) {
+    list.innerHTML = '<div class="itin-empty">点击「新增行程」开始规划你的路线</div>';
     return;
   }
-  list.innerHTML = itinerary.map((day, di) => `
-    <div class="itin-day">
-      <div class="itin-day-head">
-        <span class="itin-date">${escapeHtml(day.date)}</span>
-        <span class="itin-weekday">${escapeHtml(day.weekday)}</span>
+  list.innerHTML = itineraries.map((itin, ti) => `
+    <div class="itin-block" data-itin="${ti}">
+      <div class="itin-block-head">
+        <input type="text" class="itin-name" value="${escapeHtml(itin.name)}" title="行程名称，可编辑">
+        <span class="itin-meta">${escapeHtml(itin.days[0].date)} ~ ${escapeHtml(itin.days[itin.days.length - 1].date)} · ${itin.days.length} 天</span>
+        <button type="button" class="itin-del" title="删除此行程">✕</button>
       </div>
-      <div class="itin-grid">
-        ${PERIODS.map(p => renderItinPeriod(day, di, p)).join('')}
+      <div class="itin-block-days">
+        ${itin.days.map((day, di) => `
+          <div class="itin-day">
+            <div class="itin-day-head">
+              <span class="itin-date">${escapeHtml(day.date)}</span>
+              <span class="itin-weekday">${escapeHtml(day.weekday)}</span>
+            </div>
+            <div class="itin-grid">
+              ${PERIODS.map(p => renderItinPeriod(ti, day, di, p)).join('')}
+            </div>
+          </div>
+        `).join('')}
       </div>
     </div>
   `).join('');
 }
 
-function renderItinPeriod(day, di, p) {
+function renderItinPeriod(ti, day, di, p) {
   const loc = day.periods[p.id];
   return `
-    <div class="itin-period" data-day="${di}" data-period="${p.id}">
+    <div class="itin-period" data-itin="${ti}" data-day="${di}" data-period="${p.id}">
       <div class="itin-period-head"><span class="itin-period-label">${escapeHtml(p.label)}</span></div>
       <div class="itin-search-wrap">
         <input type="text" class="itin-search" placeholder="🔍 搜索地点" autocomplete="off" value="${loc ? escapeHtml(loc.name) : ''}">
@@ -1332,10 +1374,11 @@ function renderItinPeriod(day, di, p) {
 
 function selectItinPlace(input, item) {
   const periodEl = input.closest('.itin-period');
+  const ti = Number(periodEl.dataset.itin);
   const di = Number(periodEl.dataset.day);
   const pid = periodEl.dataset.period;
-  itinerary[di].periods[pid] = { name: item.name, lat: item.lat, lon: item.lon };
-  saveItinerary();
+  itineraries[ti].days[di].periods[pid] = { name: item.name, lat: item.lat, lon: item.lon };
+  saveItineraries();
   input.value = item.name;
   input.closest('.itin-search-wrap').querySelector('.itin-dropdown').classList.add('hidden');
   periodEl.querySelector('.itin-result').innerHTML = '';
@@ -1344,10 +1387,11 @@ function selectItinPlace(input, item) {
 
 function clearItinPlace(input) {
   const periodEl = input.closest('.itin-period');
+  const ti = Number(periodEl.dataset.itin);
   const di = Number(periodEl.dataset.day);
   const pid = periodEl.dataset.period;
-  itinerary[di].periods[pid] = null;
-  saveItinerary();
+  itineraries[ti].days[di].periods[pid] = null;
+  saveItineraries();
   periodEl.querySelector('.itin-result').innerHTML = '';
 }
 
@@ -1390,24 +1434,29 @@ function renderItinResult(period, periodId) {
   `;
 }
 
-/* 查询整个行程的适宜度：去重地点并发拉取，按日期×时段回填 */
+/* 查询所有行程的适宜度：去重地点并发拉取，按「行程×日期×时段」回填 */
 async function queryItinerary() {
-  if (!itinerary.length) { itinHint('请先生成行程', 'err'); return; }
+  if (!itineraries.length) { itinHint('请先新增行程', 'err'); return; }
 
   // 收集唯一地点（按坐标去重）
   const unique = new Map();
-  itinerary.forEach(day => {
-    for (const p of PERIODS) {
-      const loc = day.periods[p.id];
-      if (!loc) continue;
-      const key = `${loc.lat.toFixed(4)},${loc.lon.toFixed(4)}`;
-      if (!unique.has(key)) unique.set(key, loc);
-    }
+  itineraries.forEach(itin => {
+    itin.days.forEach(day => {
+      for (const p of PERIODS) {
+        const loc = day.periods[p.id];
+        if (!loc) continue;
+        const key = `${loc.lat.toFixed(4)},${loc.lon.toFixed(4)}`;
+        if (!unique.has(key)) unique.set(key, loc);
+      }
+    });
   });
   if (!unique.size) { itinHint('请先在各时段填入地点', 'err'); return; }
 
   const todayStr = localTodayStr();
-  const maxDate = itinerary.reduce((a, d) => (d.date > a ? d.date : a), '');
+  const maxDate = itineraries.reduce((a, itin) => {
+    const d = itin.days.reduce((x, day) => (day.date > x ? day.date : x), '');
+    return d > a ? d : a;
+  }, '');
   const forecastDays = daysBetween(todayStr, maxDate) + 1;
   if (forecastDays > 16 || forecastDays < 1) { itinHint('行程超出预报范围（未来最多 16 天）', 'err'); return; }
 
@@ -1439,19 +1488,21 @@ async function queryItinerary() {
 
   // 回填每个时段
   let filled = 0;
-  itinerary.forEach((day, di) => {
-    for (const p of PERIODS) {
-      const loc = day.periods[p.id];
-      const periodEl = document.querySelector(`.itin-period[data-day="${di}"][data-period="${p.id}"]`);
-      const resultEl = periodEl && periodEl.querySelector('.itin-result');
-      if (!resultEl) continue;
-      if (!loc) { resultEl.innerHTML = ''; continue; }
-      const rowsByDate = dataByLoc.get(`${loc.lat.toFixed(4)},${loc.lon.toFixed(4)}`);
-      const row = rowsByDate && rowsByDate.get(day.date);
-      const period = row && row.periods[p.id];
-      if (period) { resultEl.innerHTML = renderItinResult(period, p.id); filled++; }
-      else { resultEl.innerHTML = '<div class="itin-no-data">无该日数据</div>'; }
-    }
+  itineraries.forEach((itin, ti) => {
+    itin.days.forEach((day, di) => {
+      for (const p of PERIODS) {
+        const loc = day.periods[p.id];
+        const periodEl = document.querySelector(`.itin-period[data-itin="${ti}"][data-day="${di}"][data-period="${p.id}"]`);
+        const resultEl = periodEl && periodEl.querySelector('.itin-result');
+        if (!resultEl) continue;
+        if (!loc) { resultEl.innerHTML = ''; continue; }
+        const rowsByDate = dataByLoc.get(`${loc.lat.toFixed(4)},${loc.lon.toFixed(4)}`);
+        const row = rowsByDate && rowsByDate.get(day.date);
+        const period = row && row.periods[p.id];
+        if (period) { resultEl.innerHTML = renderItinResult(period, p.id); filled++; }
+        else { resultEl.innerHTML = '<div class="itin-no-data">无该日数据</div>'; }
+      }
+    });
   });
 
   btn.disabled = false;
@@ -1550,13 +1601,13 @@ function init() {
 
   // ===== 行程规划器事件 =====
   if ($('#itin-list') && $('#btn-itin-generate') && $('#btn-itin-query')) {
-    // 默认起始日期 = 今天；若无已存行程则生成默认 3 天
+    // 默认起始日期 = 今天；若无已存行程则生成默认 1 段 3 天
     $('#itin-start').value = localTodayStr();
-    if (!itinerary.length) {
-      itinerary = buildItinerary(localTodayStr(), 3);
-      saveItinerary();
+    if (!itineraries.length) {
+      itineraries.push({ id: cryptoRandomId(), name: '行程 1', days: buildItineraryDays(localTodayStr(), 3) });
+      saveItineraries();
     }
-    renderItinerary();
+    renderItineraries();
 
     const itinDays = $('#itin-days');
     const itinDaysVal = $('#itin-days-val');
@@ -1565,9 +1616,22 @@ function init() {
     syncItinDays();
 
     $('#btn-itin-generate').addEventListener('click', () => {
-      generateItinerary($('#itin-start').value, Number($('#itin-days').value));
+      addItinerary($('#itin-start').value, Number($('#itin-days').value));
     });
     $('#btn-itin-query').addEventListener('click', queryItinerary);
+
+    // 行程名称编辑 + 删除（事件委托）
+    $('#itin-list').addEventListener('input', (e) => {
+      const nameInput = e.target.closest('.itin-name');
+      if (!nameInput) return;
+      const block = nameInput.closest('.itin-block');
+      renameItinerary(Number(block.dataset.itin), nameInput.value);
+    });
+    $('#itin-list').addEventListener('click', (e) => {
+      const del = e.target.closest('.itin-del');
+      if (!del) return;
+      removeItinerary(Number(del.closest('.itin-block').dataset.itin));
+    });
 
     // 搜索防抖（事件委托到 itin-list）
     $('#itin-list').addEventListener('input', (e) => {
