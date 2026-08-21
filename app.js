@@ -14,6 +14,7 @@
  * ========================================================= */
 
 const API_BASE = 'https://api.open-meteo.com/v1/forecast';
+const AQI_API_BASE = 'https://air-quality-api.open-meteo.com/v1/air-quality';
 const WTTTR_BASE = 'https://wttr.in';
 const STORAGE_KEY = 'wttr.locations.v1';
 const MAX_DAYS = 16;
@@ -251,6 +252,24 @@ async function fetchWeather(loc, days) {
   return data;
 }
 
+/* ===== 查询：Open-Meteo 空气质量（逐小时，最多 7 天） ===== */
+async function fetchAirQuality(loc, days) {
+  const url = new URL(AQI_API_BASE);
+  url.searchParams.set('latitude', String(loc.lat));
+  url.searchParams.set('longitude', String(loc.lon));
+  url.searchParams.set('hourly', 'pm2_5,pm10,sulphur_dioxide,nitrogen_dioxide,ozone,carbon_monoxide');
+  url.searchParams.set('timezone', 'auto');
+  url.searchParams.set('forecast_days', String(days));
+
+  const resp = await fetch(url.toString());
+  if (!resp.ok) {
+    throw new Error(`空气质量 HTTP ${resp.status} ${resp.statusText}`);
+  }
+  const data = await resp.json();
+  if (data.error) throw new Error(data.reason || '空气质量 API 返回错误');
+  return data;
+}
+
 /* ===== 查询：wttr.in（j1 JSON，最多 3 天） ===== */
 async function fetchWttr(loc) {
   const url = `${WTTTR_BASE}/${loc.lat.toFixed(4)},${loc.lon.toFixed(4)}?format=j1&lang=zh`;
@@ -387,6 +406,124 @@ function aggregateWttr(data, periods, todayStr) {
     byDate[date] = row;
   }
   return Object.values(byDate);
+}
+
+/* ===== 中国空气质量指数 AQI（HJ 633-2012） ===== */
+
+/* 各污染物 IAQI 分段：[浓度下限, 浓度上限, IAQI下限, IAQI上限]
+ * PM2.5/PM10/SO2/NO2 为 24h 均值(μg/m³)，O3 为 8h 滑动平均(μg/m³)，CO 为 24h 均值(mg/m³) */
+const CN_AQI_BREAKPOINTS = {
+  pm2_5: [
+    [0, 35, 0, 50], [35, 75, 50, 100], [75, 115, 100, 150], [115, 150, 150, 200],
+    [150, 250, 200, 300], [250, 350, 300, 400], [350, 500, 400, 500],
+  ],
+  pm10: [
+    [0, 50, 0, 50], [50, 150, 50, 100], [150, 250, 100, 150], [250, 350, 150, 200],
+    [350, 420, 200, 300], [420, 500, 300, 400], [500, 600, 400, 500],
+  ],
+  so2: [
+    [0, 50, 0, 50], [50, 150, 50, 100], [150, 475, 100, 150], [475, 800, 150, 200],
+    [800, 1600, 200, 300], [1600, 2100, 300, 400], [2100, 2620, 400, 500],
+  ],
+  no2: [
+    [0, 40, 0, 50], [40, 80, 50, 100], [80, 180, 100, 150], [180, 280, 150, 200],
+    [280, 565, 200, 300], [565, 750, 300, 400], [750, 940, 400, 500],
+  ],
+  o3: [
+    [0, 100, 0, 50], [100, 160, 50, 100], [160, 215, 100, 150], [215, 265, 150, 200],
+    [265, 800, 200, 300],
+  ],
+  co: [
+    [0, 2, 0, 50], [2, 4, 50, 100], [4, 14, 100, 150], [14, 24, 150, 200],
+    [24, 36, 200, 300], [36, 48, 300, 400], [48, 60, 400, 500],
+  ],
+};
+
+/* 分段线性插值计算单个污染物的 IAQI */
+function iaqi(conc, breakpoints) {
+  if (conc == null || !Number.isFinite(conc)) return null;
+  for (const [cLo, cHi, iLo, iHi] of breakpoints) {
+    if (conc >= cLo && conc <= cHi) {
+      return ((iHi - iLo) / (cHi - cLo)) * (conc - cLo) + iLo;
+    }
+  }
+  const last = breakpoints[breakpoints.length - 1];
+  return conc > last[1] ? last[3] : null;
+}
+
+/* 综合各污染物 IAQI，取最大值作为 AQI，并返回首要污染物 */
+function cnAqi(day) {
+  const entries = [
+    ['PM2.5', iaqi(day.pm2_5, CN_AQI_BREAKPOINTS.pm2_5)],
+    ['PM10', iaqi(day.pm10, CN_AQI_BREAKPOINTS.pm10)],
+    ['SO₂', iaqi(day.so2, CN_AQI_BREAKPOINTS.so2)],
+    ['NO₂', iaqi(day.no2, CN_AQI_BREAKPOINTS.no2)],
+    ['O₃', iaqi(day.o3, CN_AQI_BREAKPOINTS.o3)],
+    // Open-Meteo 的 CO 单位是 μg/m³，中国标准为 mg/m³
+    ['CO', iaqi(day.co != null ? day.co / 1000 : null, CN_AQI_BREAKPOINTS.co)],
+  ];
+  let value = null, primary = null;
+  for (const [name, v] of entries) {
+    if (v != null && (value == null || v > value)) { value = v; primary = name; }
+  }
+  return { value, primary };
+}
+
+/* O3 取当日 8 小时滑动平均的最大值（不足 8 小时则退化为均值） */
+function o3EightHourMax(arr) {
+  if (!arr.length) return null;
+  if (arr.length < 8) return avg(arr);
+  let max = -Infinity;
+  for (let i = 0; i + 8 <= arr.length; i++) {
+    const m = avg(arr.slice(i, i + 8));
+    if (m > max) max = m;
+  }
+  return max;
+}
+
+/**
+ * 把 Open-Meteo 空气质量逐小时数据按「日期」聚合成每日行。
+ * @returns {Array<{date, today, weekday, pm2_5, pm10, so2, no2, o3, co, aqi, primary}>}
+ */
+function aggregateAirQuality(data, todayStr) {
+  const hourly = data.hourly || {};
+  const time = hourly.time || [];
+  const byDate = {};
+
+  const fields = ['pm2_5', 'pm10', 'sulphur_dioxide', 'nitrogen_dioxide', 'ozone', 'carbon_monoxide'];
+  for (let i = 0; i < time.length; i++) {
+    const date = time[i].slice(0, 10);
+    if (!byDate[date]) {
+      byDate[date] = { date, pm2_5: [], pm10: [], so2: [], no2: [], o3: [], co: [] };
+    }
+    const d = byDate[date];
+    fields.forEach(f => {
+      const val = (hourly[f] || [])[i];
+      if (val != null && Number.isFinite(val)) {
+        const key = f === 'sulphur_dioxide' ? 'so2' : f === 'nitrogen_dioxide' ? 'no2'
+          : f === 'ozone' ? 'o3' : f === 'carbon_monoxide' ? 'co' : f;
+        d[key].push(val);
+      }
+    });
+  }
+
+  return Object.values(byDate).map(d => {
+    const pm2_5 = avg(d.pm2_5);
+    const pm10 = avg(d.pm10);
+    const so2 = avg(d.so2);
+    const no2 = avg(d.no2);
+    const co = avg(d.co);
+    const o3 = o3EightHourMax(d.o3);
+    const aqi = cnAqi({ pm2_5, pm10, so2, no2, o3, co });
+    return {
+      date: d.date,
+      today: d.date === todayStr,
+      weekday: weekdayName(d.date),
+      pm2_5, pm10, so2, no2, o3, co,
+      aqi: aqi.value,
+      primary: aqi.primary,
+    };
+  });
 }
 
 function periodHours(p, sunrise, sunset) {
@@ -552,8 +689,13 @@ function buildCard(loc, sources, periods, todayStr) {
   body.appendChild(table);
   card.appendChild(body);
 
-  /* 逐小时趋势图（仅 Open-Meteo 提供完整逐小时 + 云量分层数据） */
+  /* 空气质量（中国标准 AQI，仅 Open-Meteo） */
   const om = sources.find(s => s.key === 'open-meteo');
+  if (om && om.aqi && om.aqi.length) {
+    renderAirQuality(card, om.aqi);
+  }
+
+  /* 逐小时趋势图（仅 Open-Meteo 提供完整逐小时 + 云量分层数据） */
   if (om && om.raw && om.raw.time && om.raw.time.length) {
     const chartWrap = document.createElement('div');
     chartWrap.className = 'chart-wrap';
@@ -576,6 +718,55 @@ function buildCard(loc, sources, periods, todayStr) {
   card.appendChild(legend);
 
   return card;
+}
+
+/* AQI 等级 → {label, color}（中国标准，HJ 633-2012） */
+function aqiLevel(aqi) {
+  if (aqi == null || !Number.isFinite(aqi)) return { label: '—', color: '#94a3b8' };
+  const a = Math.round(aqi);
+  if (a <= 50) return { label: '优', color: '#00e400' };
+  if (a <= 100) return { label: '良', color: '#facc15' };
+  if (a <= 150) return { label: '轻度污染', color: '#f97316' };
+  if (a <= 200) return { label: '中度污染', color: '#ef4444' };
+  if (a <= 300) return { label: '重度污染', color: '#a855f7' };
+  return { label: '严重污染', color: '#7e0023' };
+}
+
+function aqiMetricRow(label, rows, cellFn) {
+  return `<tr><th>${escapeHtml(label)}</th>${rows.map(r => `<td>${cellFn(r)}</td>`).join('')}</tr>`;
+}
+
+/* 渲染每日空气质量区块 */
+function renderAirQuality(card, aqiRows) {
+  if (!aqiRows || !aqiRows.length) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'aqi-wrap';
+  wrap.innerHTML = `
+    <h4>💨 每日空气质量（中国标准 AQI）</h4>
+    <table class="aqi-table">
+      <thead><tr>
+        <th>指标 \\ 日期</th>
+        ${aqiRows.map(r => `<th${r.today ? ' style="color:var(--accent)"' : ''}>${escapeHtml(r.date.slice(5))} ${escapeHtml(r.weekday)}</th>`).join('')}
+      </tr></thead>
+      <tbody>
+        ${aqiMetricRow('AQI', aqiRows, r => {
+          if (r.aqi == null) return '—';
+          const lv = aqiLevel(r.aqi);
+          const textColor = Math.round(r.aqi) <= 100 ? '#1e293b' : '#fff';
+          return `<span class="aqi-badge" style="background:${lv.color};color:${textColor}">${Math.round(r.aqi)} ${escapeHtml(lv.label)}</span>`;
+        })}
+        ${aqiMetricRow('PM2.5', aqiRows, r => r.pm2_5 == null ? '—' : `${Math.round(r.pm2_5)} <em>μg/m³</em>`)}
+        ${aqiMetricRow('PM10', aqiRows, r => r.pm10 == null ? '—' : `${Math.round(r.pm10)} <em>μg/m³</em>`)}
+        ${aqiMetricRow('SO₂', aqiRows, r => r.so2 == null ? '—' : `${Math.round(r.so2)} <em>μg/m³</em>`)}
+        ${aqiMetricRow('NO₂', aqiRows, r => r.no2 == null ? '—' : `${Math.round(r.no2)} <em>μg/m³</em>`)}
+        ${aqiMetricRow('O₃', aqiRows, r => r.o3 == null ? '—' : `${Math.round(r.o3)} <em>μg/m³</em>`)}
+        ${aqiMetricRow('CO', aqiRows, r => r.co == null ? '—' : `${(r.co / 1000).toFixed(1)} <em>mg/m³</em>`)}
+        ${aqiMetricRow('首要污染物', aqiRows, r => escapeHtml(r.primary || '—'))}
+      </tbody>
+    </table>
+    <div class="aqi-legend">AQI 依《环境空气质量指数技术规定》（HJ 633-2012），由 PM2.5 / PM10 / SO₂ / NO₂ / O₃ / CO 日浓度综合计算；数据源 Open-Meteo（逐小时聚合，最多 7 天）。</div>
+  `;
+  card.appendChild(wrap);
 }
 
 /* ISO "2026-08-18T06:34" → "06:34"；空则返回 "—" */
@@ -872,7 +1063,20 @@ async function queryAll() {
       const sources = [];
       if (useOpen) {
         const data = await fetchWeather(loc, days);
-        sources.push({ key: 'open-meteo', label: 'Open-Meteo', rows: aggregate(data, selectedPeriods, todayStr), raw: data.hourly });
+        const omSource = {
+          key: 'open-meteo', label: 'Open-Meteo',
+          rows: aggregate(data, selectedPeriods, todayStr),
+          raw: data.hourly,
+          aqi: null,
+        };
+        sources.push(omSource);
+        // 空气质量（最多 7 天）；获取失败仅跳过空气质量区块，不影响天气
+        try {
+          const aqiData = await fetchAirQuality(loc, Math.min(days, 7));
+          omSource.aqi = aggregateAirQuality(aqiData, todayStr);
+        } catch (e) {
+          console.warn(`空气质量数据获取失败（${loc.name}）：`, e);
+        }
       }
       if (useWttr) {
         const data = await fetchWttr(loc);
