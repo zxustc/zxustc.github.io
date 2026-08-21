@@ -193,6 +193,9 @@ table.forecast td.cell {
 .cell .cloud-layers { font-size: 10px; color: var(--ink-soft); margin-top: 1px; }
 .cell .precip { font-size: 11px; color: #0284c7; margin-top: 1px; }
 .cloud-hi { color: #b45309; font-weight: 700; }
+.cell .vis-cell { margin-top: 4px; padding-top: 4px; border-top: 1px dashed #e2e8f0; display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.cell .vis-cell .vis-badge { font-size: 11px; padding: 1px 8px; }
+.cell .vis-cell-lv { font-size: 10px; color: var(--ink-soft); }
 .cell .src-div { border-top: 1px dashed #cbd5e1; margin-top: 5px; padding-top: 5px; }
 .cell .src-badge { display: inline-block; font-size: 9px; color: var(--ink-soft); border: 1px solid #cbd5e1; border-radius: 4px; padding: 0 4px; margin-bottom: 2px; }
 .today { outline: 2px solid var(--accent); outline-offset: -2px; }

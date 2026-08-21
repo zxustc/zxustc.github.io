@@ -767,12 +767,21 @@ function renderResults(cards) {
 }
 
 /* 渲染单元格内的单源数据块 */
-function renderCellBlock(cell, badge, multi) {
+function renderCellBlock(cell, opts) {
+  const { badge, multi, periodId } = opts;
   const cloudCls = cell.cloud >= 75 ? ' class="cloud-hi"' : '';
   const badgeHtml = multi ? `<span class="src-badge">${escapeHtml(badge)}</span>` : '';
   const layers = (cell.cloudHi !== undefined)
     ? `<div class="cloud-layers" title="高云 / 中云 / 低云">高${cell.cloudHi} 中${cell.cloudMid} 低${cell.cloudLow}</div>`
     : '';
+  // 通透度 VisScore（仅 Open-Meteo 源提供 visibility 等字段）
+  let visHtml = '';
+  if (cell.visibility != null) {
+    const { score } = visScore(cell, periodId);
+    const lv = visLevel(score);
+    const color = visColor(score);
+    visHtml = `<div class="vis-cell" title="通透度 VisScore ${score}（${lv.desc}）"><span class="vis-badge" style="background:${color}">通透 ${score}</span><span class="vis-cell-lv">${lv.icon}${escapeHtml(lv.label)}</span></div>`;
+  }
   return (
     `<div class="wemoji">${cell.wemoji}</div>` +
     `${badgeHtml}` +
@@ -780,7 +789,8 @@ function renderCellBlock(cell, badge, multi) {
     `<div class="t">${cell.temp.toFixed(1)}°C</div>` +
     `<div class="cloud"${cloudCls}>云 ${cell.cloud}%（${cloudLevel(cell.cloud)}）</div>` +
     `${layers}` +
-    `<div class="precip">☔ ${cell.precip}%</div>`
+    `<div class="precip">☔ ${cell.precip}%</div>` +
+    `${visHtml}`
   );
 }
 
@@ -854,7 +864,7 @@ function buildCard(loc, sources, periods, todayStr) {
       const blocks = sources.map(s => {
         const row = rowsByDate[s.key].get(r.date);
         const cell = row && row.periods[p.id];
-        return cell ? renderCellBlock(cell, s.label, multi) : null;
+        return cell ? renderCellBlock(cell, { badge: s.label, multi, periodId: p.id }) : null;
       }).filter(Boolean);
 
       if (!blocks.length) {
@@ -955,13 +965,12 @@ function renderAirQuality(card, aqiRows) {
   card.appendChild(wrap);
 }
 
-/* 渲染「通透度指数 + 出游推荐」区块 */
+/* 渲染「通透度分析 + 出游推荐」区块（各时段 VisScore 已内嵌到单元格，这里只做汇总） */
 function renderVisibility(card, rows, periods) {
   if (!rows || !rows.length) return;
   const wrap = document.createElement('div');
   wrap.className = 'vis-wrap';
 
-  // 1) 每日 × 时段的 VisScore 表（按时段横向展示）
   const dimLabels = [
     ['aerosol', '气溶胶', 'PM2.5/PM10/沙尘/AOD'],
     ['visibility', '能见度', 'visibility (m)'],
@@ -971,34 +980,28 @@ function renderVisibility(card, rows, periods) {
     ['precip', '降水', '降水概率'],
   ];
 
-  // 找出全表最优时段（用于"最佳时段"标注）
+  // 找出全表最优时段（用于"最佳观赏窗口"）
   let bestCell = null;
-  const cellsHtml = rows.map(r => {
-    const cells = periods.map(p => {
+  rows.forEach(r => {
+    periods.forEach(p => {
       const period = r.periods[p.id];
-      if (!period) return '<td>—</td>';
-      const { score, dims } = visScore(period, p.id);
-      period._visScore = score;
-      period._visDims = dims;
-      const lv = visLevel(score);
-      const color = visColor(score);
-      const isBest = !bestCell || score > bestCell.score;
-      if (isBest) bestCell = { score, label: lv.label, icon: lv.icon, desc: lv.desc, date: r.date, periodLabel: p.label };
-      return `<td><span class="vis-badge" style="background:${color}">${score}</span><div class="vis-lv">${lv.icon} ${escapeHtml(lv.label)}</div></td>`;
-    }).join('');
-    return `<tr${r.today ? ' class="today-row"' : ''}><th>${escapeHtml(r.date.slice(5))} ${escapeHtml(r.weekday)}</th>${cells}</tr>`;
-  }).join('');
+      if (!period || period.visibility == null) return;
+      const { score } = visScore(period, p.id);
+      if (!bestCell || score > bestCell.score) {
+        const lv = visLevel(score);
+        bestCell = { score, label: lv.label, icon: lv.icon, desc: lv.desc, date: r.date, periodLabel: p.label };
+      }
+    });
+  });
 
-  const headerCells = periods.map(p => `<th>${escapeHtml(p.label)}</th>`).join('');
-
-  // 2) 各维度的 6 行明细表（用全日均值；展示今天的明细）
-  const todayRow = rows[0] || rows.find(r => r.today) || null;
+  // 维度构成（展示今天的全日均值）
+  const todayRow = rows.find(r => r.today) || rows[0];
   let dimsHtml = '';
   if (todayRow) {
     const fullDayAvg = avgPeriodMetrics(todayRow, periods);
     dimsHtml = `
       <div class="vis-dims">
-        <div class="vis-dims-head">📐 ${escapeHtml(todayRow.date)} 维度构成（全日）</div>
+        <div class="vis-dims-head">📐 ${escapeHtml(todayRow.date)} 通透度维度构成（全日）</div>
         <div class="vis-dims-grid">
           ${dimLabels.map(([k, label, hint]) => {
             const v = (() => {
@@ -1018,7 +1021,7 @@ function renderVisibility(card, rows, periods) {
     `;
   }
 
-  // 3) 出游推荐卡（基于全表最佳）
+  // 出游推荐卡（基于全表最佳）
   let recHtml = '';
   if (bestCell) {
     const lv = visLevel(bestCell.score);
@@ -1036,14 +1039,10 @@ function renderVisibility(card, rows, periods) {
   }
 
   wrap.innerHTML = `
-    <h4>🌄 通透度指数 VisScore（丹霞地貌适用）</h4>
-    <table class="vis-table">
-      <thead><tr><th>日期 \\ 时段</th>${headerCells}</tr></thead>
-      <tbody>${cellsHtml}</tbody>
-    </table>
+    <h4>🌄 通透度分析 & 出游推荐</h4>
     ${dimsHtml}
     ${recHtml}
-    <div class="vis-legend">VisScore 综合气溶胶（PM2.5/PM10/沙尘/AOD）、能见度、云量、湿度、风速、降水六维度；日出/夕阳时段加大气溶胶与云量权重（最影响丹霞色彩与远景）。各维度满分 100，取值越高越通透。</div>
+    <div class="vis-legend">每个时段的「通透 N」分值已显示在上方天气表中；数值越高越通透。VisScore 综合气溶胶（PM2.5/PM10/沙尘/AOD）、能见度、云量、湿度、风速、降水六维度；日出/夕阳时段加大气溶胶与云量权重。</div>
   `;
   card.appendChild(wrap);
 }
