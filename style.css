@@ -275,26 +275,6 @@ table.vis-table tr.today-row th { color: var(--accent); }
 .vis-rec-tag { font-weight: 700; font-size: 16px; padding: 4px 12px; border-radius: 999px; background: rgba(255,255,255,0.7); }
 .vis-legend { font-size: 12px; color: var(--ink-soft); margin-top: 8px; }
 
-/* ===== 每日空气质量 ===== */
-.aqi-wrap {
-  padding: 4px 16px 14px;
-  border-top: 1px dashed #e2e8f0;
-  margin: 6px 0 8px;
-  overflow-x: auto;
-}
-.aqi-wrap h4 { font-size: 13px; margin-bottom: 4px; color: var(--ink-soft); }
-table.aqi-table { border-collapse: separate; border-spacing: 6px 4px; width: max-content; min-width: 100%; }
-table.aqi-table th { font-size: 12px; color: var(--ink-soft); font-weight: 600; padding: 6px 10px; white-space: nowrap; }
-table.aqi-table th:first-child { text-align: left; }
-table.aqi-table td {
-  text-align: center; padding: 7px 6px;
-  background: #f8fafc; border: 1px solid #eef2f7; border-radius: 8px;
-  font-size: 13px; white-space: nowrap;
-}
-table.aqi-table td em { font-style: normal; font-size: 10px; color: var(--ink-soft); }
-.aqi-badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-weight: 700; font-size: 12px; }
-.aqi-legend { font-size: 12px; color: var(--ink-soft); margin-top: 6px; }
-
 .loading, .empty {
   text-align: center; color: #fff; padding: 30px; font-size: 15px;
 }
