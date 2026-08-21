@@ -311,7 +311,8 @@ function hoursAround(isoTime) {
  * 把 Open-Meteo 原始数据按「日期 × 时段」聚合成表格行。
  * @returns {Array<{date:string, weekday:string, today:boolean, sunrise:string, sunset:string, periods:Object}>}
  */
-function aggregate(data, periods, todayStr, aqiHourly) {
+function aggregate(data, periods, opts) {
+  const { todayStr, aqiHourly } = opts;
   const hourly = data.hourly;
   const daily = data.daily;
   const byDate = {};
@@ -995,8 +996,6 @@ function renderVisibility(card, rows, periods) {
   let dimsHtml = '';
   if (todayRow) {
     const fullDayAvg = avgPeriodMetrics(todayRow, periods);
-    const { score: dayScore } = visScore(fullDayAvg, 'afternoon');
-    const dayLv = visLevel(dayScore);
     dimsHtml = `
       <div class="vis-dims">
         <div class="vis-dims-head">📐 ${escapeHtml(todayRow.date)} 维度构成（全日）</div>
@@ -1375,7 +1374,7 @@ async function queryAll() {
         }
         const omSource = {
           key: 'open-meteo', label: 'Open-Meteo',
-          rows: aggregate(data, selectedPeriods, todayStr, aqiData && aqiData.hourly),
+          rows: aggregate(data, selectedPeriods, { todayStr, aqiHourly: aqiData && aqiData.hourly }),
           raw: data.hourly,
           aqi: aqiData ? aggregateAirQuality(aqiData, todayStr) : null,
         };
