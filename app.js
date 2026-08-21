@@ -237,7 +237,7 @@ async function fetchWeather(loc, days) {
   const url = new URL(API_BASE);
   url.searchParams.set('latitude', String(loc.lat));
   url.searchParams.set('longitude', String(loc.lon));
-  url.searchParams.set('hourly', 'temperature_2m,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,precipitation_probability,weather_code');
+  url.searchParams.set('hourly', 'temperature_2m,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,precipitation_probability,weather_code,visibility,relative_humidity_2m,dew_point_2m,wind_speed_10m');
   url.searchParams.set('daily', 'weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset');
   url.searchParams.set('timezone', 'auto');
   url.searchParams.set('forecast_days', String(days));
@@ -257,7 +257,7 @@ async function fetchAirQuality(loc, days) {
   const url = new URL(AQI_API_BASE);
   url.searchParams.set('latitude', String(loc.lat));
   url.searchParams.set('longitude', String(loc.lon));
-  url.searchParams.set('hourly', 'pm2_5,pm10,sulphur_dioxide,nitrogen_dioxide,ozone,carbon_monoxide');
+  url.searchParams.set('hourly', 'pm2_5,pm10,sulphur_dioxide,nitrogen_dioxide,ozone,carbon_monoxide,dust,aerosol_optical_depth');
   url.searchParams.set('timezone', 'auto');
   url.searchParams.set('forecast_days', String(days));
 
@@ -311,7 +311,7 @@ function hoursAround(isoTime) {
  * 把 Open-Meteo 原始数据按「日期 × 时段」聚合成表格行。
  * @returns {Array<{date:string, weekday:string, today:boolean, sunrise:string, sunset:string, periods:Object}>}
  */
-function aggregate(data, periods, todayStr) {
+function aggregate(data, periods, todayStr, aqiHourly) {
   const hourly = data.hourly;
   const daily = data.daily;
   const byDate = {};
@@ -329,6 +329,8 @@ function aggregate(data, periods, todayStr) {
     for (const p of periods) {
       const hours = periodHours(p, row.sunrise, row.sunset);
       const temps = [], clouds = [], cloudsHi = [], cloudsMid = [], cloudsLow = [], precips = [], codes = [];
+      const visibs = [], humis = [], winds = [];
+      const pm25s = [], pm10s = [], dusts = [], aods = [];
       for (let j = 0; j < hourly.time.length; j++) {
         const t = hourly.time[j];
         if (!t.startsWith(date)) continue;
@@ -341,6 +343,37 @@ function aggregate(data, periods, todayStr) {
           if (hourly.cloud_cover_high[j] !== null) cloudsHi.push(hourly.cloud_cover_high[j]);
           if (hourly.precipitation_probability[j] !== null) precips.push(hourly.precipitation_probability[j]);
           codes.push(hourly.weather_code[j]);
+          // 通透度相关字段（API 不返回时为 undefined）
+          if (hourly.visibility) {
+            const v = hourly.visibility[j];
+            if (Number.isFinite(v)) visibs.push(v);
+          }
+          if (hourly.relative_humidity_2m) {
+            const h = hourly.relative_humidity_2m[j];
+            if (Number.isFinite(h)) humis.push(h);
+          }
+          if (hourly.wind_speed_10m) {
+            const w = hourly.wind_speed_10m[j];
+            if (Number.isFinite(w)) winds.push(w);
+          }
+        }
+      }
+      // 空气质量字段：按小时对齐（两 API 均返回带 timezone=auto 的 ISO 小时串）
+      if (aqiHourly && aqiHourly.time) {
+        for (let j = 0; j < aqiHourly.time.length; j++) {
+          const t = aqiHourly.time[j];
+          if (!t.startsWith(date)) continue;
+          const hh = Number(t.slice(11, 13));
+          if (hours.includes(hh)) {
+            const v = aqiHourly.pm2_5 && aqiHourly.pm2_5[j];
+            if (Number.isFinite(v)) pm25s.push(v);
+            const v10 = aqiHourly.pm10 && aqiHourly.pm10[j];
+            if (Number.isFinite(v10)) pm10s.push(v10);
+            const d = aqiHourly.dust && aqiHourly.dust[j];
+            if (Number.isFinite(d)) dusts.push(d);
+            const a = aqiHourly.aerosol_optical_depth && aqiHourly.aerosol_optical_depth[j];
+            if (Number.isFinite(a)) aods.push(a);
+          }
         }
       }
       if (temps.length) {
@@ -354,6 +387,14 @@ function aggregate(data, periods, todayStr) {
           cloudLow: Math.round(avg(cloudsLow) ?? 0),
           precip: Math.round(avg(precips) ?? 0),
           code, wtxt, wemoji,
+          // 通透度原始小时均值（用于后续 VisScore）
+          visibility: visibs.length ? avg(visibs) : null,
+          humidity: humis.length ? avg(humis) : null,
+          windSpeed: winds.length ? avg(winds) : null,
+          pm25: pm25s.length ? avg(pm25s) : null,
+          pm10: pm10s.length ? avg(pm10s) : null,
+          dust: dusts.length ? avg(dusts) : null,
+          aod: aods.length ? avg(aods) : null,
         };
       }
     }
@@ -532,6 +573,145 @@ function periodHours(p, sunrise, sunset) {
   return p.hours;
 }
 
+/* ===== 通透度指数 VisScore（0-100）=====
+ * 综合六维因素，按丹霞地貌"远眺 + 色彩 + 夕照"优化权重。
+ * 输入为按时段聚合的小时均值；子项缺失则按"中性 75 分"近似，避免过度扣分。
+ */
+function pieceLinear(x, points) {
+  if (x == null || !Number.isFinite(x)) return null;
+  for (let i = 0; i < points.length; i++) {
+    const [x1, x2, s1, s2] = points[i];
+    if (x <= x1) return s1;
+    if (x < x2) return s1 + (s2 - s1) * (x - x1) / (x2 - x1);
+  }
+  return points[points.length - 1][3];
+}
+
+function scoreAerosol(p) {
+  const subs = [];
+  // PM2.5 国标 24h 一级 35、二级 75
+  const pm25 = pieceLinear(p.pm25, [[0, 35, 100, 80], [35, 75, 80, 50], [75, 115, 50, 25], [115, 150, 25, 10], [150, 250, 10, 0]]);
+  if (pm25 != null) subs.push(pm25);
+  // PM10
+  const pm10 = pieceLinear(p.pm10, [[0, 50, 100, 85], [50, 150, 85, 55], [150, 250, 55, 25], [250, 350, 25, 10], [350, 500, 10, 0]]);
+  if (pm10 != null) subs.push(pm10);
+  // 沙尘（西北地区关键）
+  const dust = pieceLinear(p.dust, [[0, 1, 100, 95], [1, 30, 95, 70], [30, 100, 70, 35], [100, 250, 35, 5], [250, 1e9, 5, 0]]);
+  if (dust != null) subs.push(dust);
+  // AOD
+  const aod = pieceLinear(p.aod, [[0, 0.1, 100, 90], [0.1, 0.3, 90, 70], [0.3, 0.5, 70, 45], [0.5, 1.0, 45, 15], [1.0, 3.0, 15, 0]]);
+  if (aod != null) subs.push(aod);
+  if (!subs.length) return 75;
+  // 取短板（最低分），符合"最差因子决定通透度"的物理直觉
+  return Math.min(...subs);
+}
+
+function scoreVisibility(v) {
+  if (v == null || !Number.isFinite(v)) return 75;
+  // v 单位 m
+  const km = v / 1000;
+  if (km >= 30) return 100;
+  if (km >= 20) return 95;
+  if (km >= 15) return 88;
+  if (km >= 10) return 75;
+  if (km >= 5) return 50;
+  if (km >= 2) return 25;
+  if (km >= 1) return 10;
+  return 0;
+}
+
+function scoreCloud(period) {
+  const total = period.cloud;
+  const low = period.cloudLow;
+  // 低云权重 0.6、总云 0.4（低云更影响远眺）
+  let totalScore = null, lowScore = null;
+  if (total != null) {
+    totalScore = pieceLinear(total, [[0, 20, 100, 92], [20, 50, 92, 70], [50, 75, 70, 40], [75, 100, 40, 5]]);
+  }
+  if (low != null) {
+    lowScore = pieceLinear(low, [[0, 15, 100, 85], [15, 40, 85, 55], [40, 70, 55, 25], [70, 100, 25, 0]]);
+  }
+  const w = [lowScore, totalScore];
+  const wts = [0.6, 0.4];
+  let sum = 0, totalWt = 0;
+  for (let i = 0; i < w.length; i++) {
+    if (w[i] != null) { sum += w[i] * wts[i]; totalWt += wts[i]; }
+  }
+  if (totalWt === 0) return 75;
+  return sum / totalWt;
+}
+
+function scoreHumidity(h) {
+  if (h == null || !Number.isFinite(h)) return 75;
+  // 最佳区间 30-60%；偏离扣分
+  if (h >= 30 && h <= 60) return 100;
+  if (h >= 20 && h < 30) return 85;
+  if (h > 60 && h <= 75) return 80;
+  if (h >= 10 && h < 20) return 55; // 干燥扬尘
+  if (h > 75 && h <= 85) return 40;
+  if (h > 85 && h <= 95) return 15; // 雾
+  if (h > 95) return 0;
+  if (h < 10) return 30;
+  return 50;
+}
+
+function scoreWind(w) {
+  if (w == null || !Number.isFinite(w)) return 75;
+  // km/h；张掖等西北地区 5-15 最佳；过强扬尘
+  if (w >= 5 && w <= 15) return 100;
+  if (w >= 3 && w < 5) return 85;
+  if (w > 15 && w <= 25) return 85;
+  if (w > 25 && w <= 40) return 55;
+  if (w > 40) return 25;
+  if (w < 3) return 70; // 静稳易积累污染物
+  return 70;
+}
+
+function scorePrecip(p) {
+  return pieceLinear(p.precip, [[0, 5, 100, 95], [5, 20, 95, 75], [20, 40, 75, 50], [40, 60, 50, 25], [60, 80, 25, 8], [80, 100, 8, 0]]);
+}
+
+/* 综合 VisScore
+ * @param p 按时段聚合的指标对象（含 visibility/humidity/windSpeed/pm25/pm10/dust/aod/cloud/cloudLow/precip）
+ * @param periodId 'sunrise'|'sunset'|其他
+ */
+function visScore(p, periodId) {
+  const dims = {
+    aerosol: scoreAerosol(p),
+    visibility: scoreVisibility(p.visibility),
+    cloud: scoreCloud(p),
+    humidity: scoreHumidity(p.humidity),
+    wind: scoreWind(p.windSpeed),
+    precip: scorePrecip(p.precip),
+  };
+  // 日出/夕阳：气溶胶和云量更影响远眺与色彩，权重加大
+  const isGolden = periodId === 'sunrise' || periodId === 'sunset';
+  const w = isGolden
+    ? { aerosol: 0.35, visibility: 0.15, cloud: 0.25, humidity: 0.10, wind: 0.08, precip: 0.07 }
+    : { aerosol: 0.30, visibility: 0.20, cloud: 0.20, humidity: 0.10, wind: 0.10, precip: 0.10 };
+  let score = 0;
+  for (const k of Object.keys(w)) score += dims[k] * w[k];
+  return { score: Math.round(score), dims };
+}
+
+function visLevel(score) {
+  if (score >= 90) return { label: '极佳', icon: '✨', desc: '通透如镜，丹霞色彩饱和、远景清晰' };
+  if (score >= 75) return { label: '优', icon: '👍', desc: '通透良好，观赏体验佳' };
+  if (score >= 60) return { label: '良', icon: '✓', desc: '基本通透，色彩略受影响' };
+  if (score >= 40) return { label: '一般', icon: '⚠️', desc: '通透度有限，建议慎重' };
+  if (score >= 20) return { label: '较差', icon: '❌', desc: '不推荐观赏' };
+  return { label: '极差', icon: '⛔', desc: '沙尘/雾/雨雪，不宜出游' };
+}
+
+function visColor(score) {
+  if (score >= 90) return '#059669'; // 深绿
+  if (score >= 75) return '#16a34a'; // 绿
+  if (score >= 60) return '#facc15'; // 黄
+  if (score >= 40) return '#f97316'; // 橙
+  if (score >= 20) return '#ef4444'; // 红
+  return '#7e0023';
+}
+
 function weekdayName(dateStr) {
   const d = new Date(dateStr + 'T00:00:00');
   return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][d.getDay()];
@@ -695,6 +875,11 @@ function buildCard(loc, sources, periods, todayStr) {
     renderAirQuality(card, om.aqi);
   }
 
+  /* 通透度指数 VisScore + 出游推荐（仅 Open-Meteo） */
+  if (om && om.rows && om.rows.length) {
+    renderVisibility(card, om.rows, periods);
+  }
+
   /* 逐小时趋势图（仅 Open-Meteo 提供完整逐小时 + 云量分层数据） */
   if (om && om.raw && om.raw.time && om.raw.time.length) {
     const chartWrap = document.createElement('div');
@@ -767,6 +952,125 @@ function renderAirQuality(card, aqiRows) {
     <div class="aqi-legend">AQI 依《环境空气质量指数技术规定》（HJ 633-2012），由 PM2.5 / PM10 / SO₂ / NO₂ / O₃ / CO 日浓度综合计算；数据源 Open-Meteo（逐小时聚合，最多 7 天）。</div>
   `;
   card.appendChild(wrap);
+}
+
+/* 渲染「通透度指数 + 出游推荐」区块 */
+function renderVisibility(card, rows, periods) {
+  if (!rows || !rows.length) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'vis-wrap';
+
+  // 1) 每日 × 时段的 VisScore 表（按时段横向展示）
+  const dimLabels = [
+    ['aerosol', '气溶胶', 'PM2.5/PM10/沙尘/AOD'],
+    ['visibility', '能见度', 'visibility (m)'],
+    ['cloud', '云量', '低云 / 总云'],
+    ['humidity', '湿度', '相对湿度'],
+    ['wind', '风速', 'wind_speed_10m'],
+    ['precip', '降水', '降水概率'],
+  ];
+
+  // 找出全表最优时段（用于"最佳时段"标注）
+  let bestCell = null;
+  const cellsHtml = rows.map(r => {
+    const cells = periods.map(p => {
+      const period = r.periods[p.id];
+      if (!period) return '<td>—</td>';
+      const { score, dims } = visScore(period, p.id);
+      period._visScore = score;
+      period._visDims = dims;
+      const lv = visLevel(score);
+      const color = visColor(score);
+      const isBest = !bestCell || score > bestCell.score;
+      if (isBest) bestCell = { score, label: lv.label, icon: lv.icon, desc: lv.desc, date: r.date, periodLabel: p.label };
+      return `<td><span class="vis-badge" style="background:${color}">${score}</span><div class="vis-lv">${lv.icon} ${escapeHtml(lv.label)}</div></td>`;
+    }).join('');
+    return `<tr${r.today ? ' class="today-row"' : ''}><th>${escapeHtml(r.date.slice(5))} ${escapeHtml(r.weekday)}</th>${cells}</tr>`;
+  }).join('');
+
+  const headerCells = periods.map(p => `<th>${escapeHtml(p.label)}</th>`).join('');
+
+  // 2) 各维度的 6 行明细表（用全日均值；展示今天的明细）
+  const todayRow = rows[0] || rows.find(r => r.today) || null;
+  let dimsHtml = '';
+  if (todayRow) {
+    const fullDayAvg = avgPeriodMetrics(todayRow, periods);
+    const { score: dayScore } = visScore(fullDayAvg, 'afternoon');
+    const dayLv = visLevel(dayScore);
+    dimsHtml = `
+      <div class="vis-dims">
+        <div class="vis-dims-head">📐 ${escapeHtml(todayRow.date)} 维度构成（全日）</div>
+        <div class="vis-dims-grid">
+          ${dimLabels.map(([k, label, hint]) => {
+            const v = (() => {
+              switch (k) {
+                case 'aerosol': return scoreAerosol(fullDayAvg);
+                case 'visibility': return scoreVisibility(fullDayAvg.visibility);
+                case 'cloud': return scoreCloud(fullDayAvg);
+                case 'humidity': return scoreHumidity(fullDayAvg.humidity);
+                case 'wind': return scoreWind(fullDayAvg.windSpeed);
+                case 'precip': return scorePrecip(fullDayAvg.precip);
+              }
+            })();
+            return `<div class="vis-dim"><div class="vis-dim-bar"><i style="width:${Math.round(v)}%;background:${visColor(v)}"></i></div><div class="vis-dim-meta"><b>${escapeHtml(label)}</b> <span>${Math.round(v)}</span><em>${escapeHtml(hint)}</em></div></div>`;
+          }).join('')}
+        </div>
+      </div>
+    `;
+  }
+
+  // 3) 出游推荐卡（基于全表最佳）
+  let recHtml = '';
+  if (bestCell) {
+    const lv = visLevel(bestCell.score);
+    const tone = bestCell.score >= 75 ? 'ok' : bestCell.score >= 60 ? 'warn' : 'err';
+    recHtml = `
+      <div class="vis-rec vis-rec-${tone}">
+        <div class="vis-rec-icon">${lv.icon}</div>
+        <div class="vis-rec-body">
+          <div class="vis-rec-title">最佳观赏窗口：${escapeHtml(bestCell.date)} ${escapeHtml(bestCell.periodLabel)}（VisScore ${bestCell.score}）</div>
+          <div class="vis-rec-desc">${escapeHtml(lv.desc)}</div>
+        </div>
+        <div class="vis-rec-tag">${escapeHtml(lv.label)}</div>
+      </div>
+    `;
+  }
+
+  wrap.innerHTML = `
+    <h4>🌄 通透度指数 VisScore（丹霞地貌适用）</h4>
+    <table class="vis-table">
+      <thead><tr><th>日期 \\ 时段</th>${headerCells}</tr></thead>
+      <tbody>${cellsHtml}</tbody>
+    </table>
+    ${dimsHtml}
+    ${recHtml}
+    <div class="vis-legend">VisScore 综合气溶胶（PM2.5/PM10/沙尘/AOD）、能见度、云量、湿度、风速、降水六维度；日出/夕阳时段加大气溶胶与云量权重（最影响丹霞色彩与远景）。各维度满分 100，取值越高越通透。</div>
+  `;
+  card.appendChild(wrap);
+}
+
+/* 把一整天所有时段的小时均值再聚合一次（用于"全日维度构成"） */
+function avgPeriodMetrics(dayRow, periods) {
+  const fields = ['visibility', 'humidity', 'windSpeed', 'pm25', 'pm10', 'dust', 'aod',
+                  'cloud', 'cloudLow', 'precip'];
+  const acc = {};
+  const cnt = {};
+  for (const p of periods) {
+    const period = dayRow.periods[p.id];
+    if (!period) continue;
+    for (const f of fields) {
+      const v = period[f];
+      if (v != null && Number.isFinite(v)) {
+        acc[f] = (acc[f] || 0) + v;
+        cnt[f] = (cnt[f] || 0) + 1;
+      }
+    }
+  }
+  const out = {};
+  for (const f of fields) {
+    out[f] = cnt[f] ? acc[f] / cnt[f] : null;
+  }
+  return out;
 }
 
 /* ISO "2026-08-18T06:34" → "06:34"；空则返回 "—" */
@@ -1063,20 +1367,19 @@ async function queryAll() {
       const sources = [];
       if (useOpen) {
         const data = await fetchWeather(loc, days);
-        const omSource = {
-          key: 'open-meteo', label: 'Open-Meteo',
-          rows: aggregate(data, selectedPeriods, todayStr),
-          raw: data.hourly,
-          aqi: null,
-        };
-        sources.push(omSource);
-        // 空气质量（最多 7 天）；获取失败仅跳过空气质量区块，不影响天气
+        let aqiData = null;
         try {
-          const aqiData = await fetchAirQuality(loc, Math.min(days, 7));
-          omSource.aqi = aggregateAirQuality(aqiData, todayStr);
+          aqiData = await fetchAirQuality(loc, Math.min(days, 7));
         } catch (e) {
           console.warn(`空气质量数据获取失败（${loc.name}）：`, e);
         }
+        const omSource = {
+          key: 'open-meteo', label: 'Open-Meteo',
+          rows: aggregate(data, selectedPeriods, todayStr, aqiData && aqiData.hourly),
+          raw: data.hourly,
+          aqi: aqiData ? aggregateAirQuality(aqiData, todayStr) : null,
+        };
+        sources.push(omSource);
       }
       if (useWttr) {
         const data = await fetchWttr(loc);
