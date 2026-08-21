@@ -1247,7 +1247,7 @@ function loadItinerary() {
       const list = JSON.parse(raw);
       if (Array.isArray(list) && list.length) return list;
     }
-  } catch (e) { /* 存储不可用则返回空 */ }
+  } catch { /* 存储不可用则返回空 */ }
   return [];
 }
 
@@ -1349,6 +1349,25 @@ function clearItinPlace(input) {
   itinerary[di].periods[pid] = null;
   saveItinerary();
   periodEl.querySelector('.itin-result').innerHTML = '';
+}
+
+/* 聚焦空输入框时，下拉展示已保存地点（复用地点管理里的地点） */
+function showItinSavedPlaces(input) {
+  const dd = input.closest('.itin-search-wrap').querySelector('.itin-dropdown');
+  dd._savedItems = locations;
+  dd._input = input;
+  if (!locations.length) {
+    dd.innerHTML = '<div class="sug-empty">暂无已保存地点，请在上方「地点管理」添加，或直接输入搜索</div>';
+  } else {
+    dd.innerHTML =
+      '<div class="itin-saved-title">📌 已保存地点（点击复用）</div>' +
+      locations.map((loc, i) => `
+        <button type="button" class="sug itin-saved-sug" data-i="${i}">
+          <span class="sug-name">${escapeHtml(loc.name)}</span>
+          <span class="sug-sub">${escapeHtml(formatCoord(loc.lat, loc.lon))}${loc.note ? ' · ' + escapeHtml(loc.note) : ''}</span>
+        </button>`).join('');
+  }
+  dd.classList.remove('hidden');
 }
 
 /* 渲染单个时段的适宜度卡片 */
@@ -1575,13 +1594,24 @@ function init() {
       }, 400);
     });
 
-    // 下拉选中
+    // 聚焦空输入框 → 显示已保存地点
+    $('#itin-list').addEventListener('focusin', (e) => {
+      const input = e.target.closest('.itin-search');
+      if (!input) return;
+      if (!input.value.trim()) showItinSavedPlaces(input);
+    });
+
+    // 下拉选中（兼容搜索结果 + 已保存地点）
     $('#itin-list').addEventListener('click', (e) => {
+      const saved = e.target.closest('.itin-saved-sug');
       const sug = e.target.closest('.itin-sug');
-      if (!sug) return;
+      const target = saved || sug;
+      if (!target) return;
       e.preventDefault();
-      const dd = sug.closest('.itin-dropdown');
-      const item = dd._items && dd._items[Number(sug.dataset.i)];
+      const dd = target.closest('.itin-dropdown');
+      const item = saved
+        ? (dd._savedItems && dd._savedItems[Number(saved.dataset.i)])
+        : (dd._items && dd._items[Number(sug.dataset.i)]);
       if (item) selectItinPlace(dd._input, item);
     });
 
