@@ -237,7 +237,7 @@ async function fetchWeather(loc, days) {
   const url = new URL(API_BASE);
   url.searchParams.set('latitude', String(loc.lat));
   url.searchParams.set('longitude', String(loc.lon));
-  url.searchParams.set('hourly', 'temperature_2m,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,precipitation_probability,weather_code,visibility,relative_humidity_2m,dew_point_2m,wind_speed_10m');
+  url.searchParams.set('hourly', 'temperature_2m,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,precipitation_probability,weather_code,visibility,relative_humidity_2m,wind_speed_10m');
   url.searchParams.set('daily', 'weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset');
   url.searchParams.set('timezone', 'auto');
   url.searchParams.set('forecast_days', String(days));
@@ -1184,37 +1184,44 @@ async function queryAll() {
   box.innerHTML = '<div class="loading">⏳ 正在获取天气数据…</div>';
 
   const todayStr = localTodayStr();
-  const cards = [];
-  const errors = [];
 
-  for (const idx of selectedIdx) {
+  // 并行查询：多个地点之间、每个地点内的天气/空气质量/wttr 三路均并发，
+  // 避免串行等待。单个地点失败不影响其他地点。
+  const tasks = selectedIdx.map(async (idx) => {
     const loc = locations[idx];
     try {
+      // 三路独立请求并发；未启用的源用 null 占位（Promise.all 会视为已 resolve）
+      const pWeather = useOpen ? fetchWeather(loc, days) : null;
+      const pAqi = useOpen
+        ? fetchAirQuality(loc, Math.min(days, 7)).catch((e) => {
+            console.warn(`空气质量数据获取失败（${loc.name}）：`, e);
+            return null; // 空气质量失败仅降级，不影响天气
+          })
+        : null;
+      const pWttr = useWttr ? fetchWttr(loc) : null;
+
+      const [data, aqiData, wttrData] = await Promise.all([pWeather, pAqi, pWttr]);
+
       const sources = [];
       if (useOpen) {
-        const data = await fetchWeather(loc, days);
-        let aqiData = null;
-        try {
-          aqiData = await fetchAirQuality(loc, Math.min(days, 7));
-        } catch (e) {
-          console.warn(`空气质量数据获取失败（${loc.name}）：`, e);
-        }
-        const omSource = {
+        sources.push({
           key: 'open-meteo', label: 'Open-Meteo',
           rows: aggregate(data, selectedPeriods, { todayStr, aqiHourly: aqiData && aqiData.hourly }),
           raw: data.hourly,
-        };
-        sources.push(omSource);
+        });
       }
       if (useWttr) {
-        const data = await fetchWttr(loc);
-        sources.push({ key: 'wttr', label: 'wttr.in', rows: aggregateWttr(data, selectedPeriods, todayStr) });
+        sources.push({ key: 'wttr', label: 'wttr.in', rows: aggregateWttr(wttrData, selectedPeriods, todayStr) });
       }
-      cards.push(buildCard(loc, sources, selectedPeriods, todayStr));
+      return { card: buildCard(loc, sources, selectedPeriods, todayStr) };
     } catch (e) {
-      errors.push(`${loc.name}：${e.message}`);
+      return { error: `${loc.name}：${e.message}` };
     }
-  }
+  });
+
+  const results = await Promise.all(tasks);
+  const cards = results.filter(r => r.card).map(r => r.card);
+  const errors = results.filter(r => r.error).map(r => r.error);
 
   btn.disabled = false;
   btn.textContent = '查询天气';
