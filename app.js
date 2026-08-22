@@ -1349,7 +1349,7 @@ function renderItineraries() {
               <span class="itin-weekday">${escapeHtml(day.weekday)}</span>
             </div>
             <div class="itin-grid">
-              ${PERIODS.map(p => renderItinPeriod(ti, day, di, p)).join('')}
+              ${PERIODS.map(p => renderItinPeriod({ ti, day, di, p })).join('')}
             </div>
           </div>
         `).join('')}
@@ -1358,7 +1358,8 @@ function renderItineraries() {
   `).join('');
 }
 
-function renderItinPeriod(ti, day, di, p) {
+function renderItinPeriod(opts) {
+  const { ti, day, di, p } = opts;
   const loc = day.periods[p.id];
   return `
     <div class="itin-period" data-itin="${ti}" data-day="${di}" data-period="${p.id}">
